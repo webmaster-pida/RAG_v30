@@ -13,7 +13,6 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-# LangChain y Google Cloud
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -21,7 +20,6 @@ from langchain_google_firestore import FirestoreVectorStore
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK google-genai y VertexAI
 from google import genai
 from google.genai.types import EmbedContentConfig
 from vertexai.generative_models import GenerativeModel, GenerationConfig
@@ -30,8 +28,6 @@ import vertexai
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Mantenemos v2 para no mezclar con la v1 antigua si ya hiciste pruebas, 
-# pero ahora con la dimensión correcta (2048)
 COLLECTION_NAME = "pida_knowledge_base_v2" 
 
 class QueryRequest(BaseModel):
@@ -41,7 +37,6 @@ class QueryRequest(BaseModel):
 
 clients = {}
 
-# --- CLASE DE EMBEDDINGS CORREGIDA (2048 DIMENSIONES) ---
 class ModernGeminiEmbeddings(Embeddings):
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
@@ -53,10 +48,7 @@ class ModernGeminiEmbeddings(Embeddings):
         response = self.client.models.embed_content(
             model=self.model_name,
             contents=texts,
-            config=EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=self.dimensionality, # <--- FORZADO A 2048 PARA FIRESTORE
-            )
+            config=EmbedContentConfig(task_type=task_type, output_dimensionality=self.dimensionality)
         )
         return [emb.values for emb in response.embeddings]
 
@@ -67,12 +59,10 @@ class ModernGeminiEmbeddings(Embeddings):
             batch = texts[i:i + batch_size]
             results = self._get_embeddings_with_retry(batch, "RETRIEVAL_DOCUMENT")
             embeddings.extend(results)
-            logger.info(f"Embeddings (2048d) generados: lote {i//batch_size + 1}")
         return embeddings
 
     def embed_query(self, text: str) -> List[float]:
-        results = self._get_embeddings_with_retry([text], "RETRIEVAL_QUERY")
-        return results[0]
+        return self._get_embeddings_with_retry([text], "RETRIEVAL_QUERY")[0]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,14 +72,14 @@ async def lifespan(app: FastAPI):
     
     clients['firestore'] = firestore.Client()
     clients['storage'] = storage.Client()
-    clients['embedding'] = ModernGeminiEmbeddings(dimensionality=2048)
+    clients['embedding'] = ModernGeminiEmbeddings()
     clients['metadata_model'] = GenerativeModel("gemini-2.5-flash")
     clients['vector_store'] = FirestoreVectorStore(
         collection=COLLECTION_NAME, 
         embedding_service=clients['embedding'], 
         client=clients['firestore']
     )
-    logger.info("--- Microservicio RAG v30 (2048d) Inicializado ---")
+    logger.info("--- RAG v30 (2048d) CARGADO ---")
     yield
     clients.clear()
 
@@ -100,14 +90,35 @@ def _process_and_embed_text_file(file_path: str, filename: str):
     vector_store = clients.get('vector_store')
     meta_model = clients.get('metadata_model')
     
-    # 1. Metadatos inteligentes
+    logger.info(f"[DEBUG 1] Leyendo archivo: {filename}")
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         text_content = f.read()
     
+    if not text_content.strip():
+        logger.error("[ERROR] El archivo está vacío.")
+        return
+
+    # --- NUEVO: LIMPIEZA PREVIA ---
+    logger.info(f"[DEBUG 2] Limpiando rastro anterior de {filename} en {COLLECTION_NAME}...")
+    docs_ref = db.collection(COLLECTION_NAME)
+    docs_to_delete = docs_ref.where(filter=FieldFilter("metadata.source", "==", filename)).stream()
+    deleted_count = 0
+    async def delete_docs(): # Helper para limpiar
+        nonlocal deleted_count
+        async for doc in docs_to_delete:
+            await doc.reference.delete()
+            deleted_count += 1
+    # Nota: Firestore SDK en este wrapper es sincrónico, usamos loop directo
+    for doc in db.collection(COLLECTION_NAME).where(filter=FieldFilter("metadata.source", "==", filename)).stream():
+        doc.reference.delete()
+        deleted_count += 1
+    logger.info(f"[DEBUG 2.1] Se borraron {deleted_count} fragmentos antiguos.")
+
+    logger.info("[DEBUG 3] Extrayendo metadatos con Gemini...")
     doc_title, doc_author = filename, "Autor Desconocido"
     try:
         meta_response = meta_model.generate_content(
-            f"Extrae Título y Autor de este texto: {text_content[:3000]}",
+            f"Extrae Título y Autor: {text_content[:2000]}",
             generation_config=GenerationConfig(
                 response_mime_type="application/json",
                 response_schema={"type":"OBJECT","properties":{"title":{"type":"STRING"},"author":{"type":"STRING"}},"required":["title","author"]},
@@ -115,13 +126,19 @@ def _process_and_embed_text_file(file_path: str, filename: str):
             )
         )
         meta = json.loads(meta_response.text)
-        doc_title, doc_author = meta.get("title", filename), meta.get("author", "Autor Desconocido")
-    except Exception: pass
+        doc_title = meta.get("title", filename)
+        doc_author = meta.get("author", "Autor Desconocido")
+        logger.info(f"[DEBUG 3.1] Título: {doc_title} | Autor: {doc_author}")
+    except Exception as e:
+        logger.warning(f"[ALERTA] Fallo metadatos IA: {e}")
 
-    # 2. Chunking
+    logger.info("[DEBUG 4] Iniciando Chunking (División de texto)...")
     md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","H1"),("##","H2"),("###","H3")])
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=250)
-    chunks = text_splitter.split_documents(md_splitter.split_text(text_content))
+    
+    md_docs = md_splitter.split_text(text_content)
+    chunks = text_splitter.split_documents(md_docs)
+    logger.info(f"[DEBUG 4.1] Texto dividido en {len(chunks)} fragmentos.")
     
     documents = []
     for i, chunk in enumerate(chunks):
@@ -129,29 +146,42 @@ def _process_and_embed_text_file(file_path: str, filename: str):
         m.update({"source": filename, "title": doc_title, "author": doc_author, "index": i})
         documents.append(Document(page_content=chunk.page_content, metadata=m))
     
-    # 3. Guardado (Firestore limitará esto a 2048d)
+    logger.info(f"[DEBUG 5] Iniciando guardado en Firestore (Dimensiones: 2048)...")
     batch_size = 50
     for i in range(0, len(documents), batch_size):
-        vector_store.add_documents(documents[i:i + batch_size])
-    logger.info(f"Éxito: {filename} indexado con 2048 dimensiones.")
+        batch = documents[i:i + batch_size]
+        vector_store.add_documents(batch)
+        logger.info(f"[PROGRESS] Guardado lote {i//batch_size + 1}")
+    
+    logger.info(f"--- ¡ÉXITO TOTAL! {filename} indexado correctamente en {COLLECTION_NAME} ---")
 
 @app.post("/")
 async def handle_gcs_event(request: Request):
     event = await request.json()
     bucket_name, file_id = event.get("bucket"), event.get("name")
-    if not bucket_name or not file_id or not (file_id.endswith(".md") or file_id.endswith(".txt")):
+    if not bucket_name or not file_id: return {"status": "ignored"}
+    if not (file_id.endswith(".md") or file_id.endswith(".txt")):
+        logger.info(f"Ignorado por extensión: {file_id}")
         return {"status": "ignored"}
 
+    logger.info(f"--- EVENTO RECIBIDO: {file_id} ---")
     storage_client = clients.get('storage')
     blob = storage_client.bucket(bucket_name).blob(file_id)
     
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         blob.download_to_filename(tmp.name)
-        # Síncrono para mantener vivo el CPU de Cloud Run
-        await asyncio.to_thread(_process_and_embed_text_file, tmp.name, file_id)
-        os.unlink(tmp.name)
+        tmp_name = tmp.name
+    
+    try:
+        # Ejecución síncrona real para bloquear el hilo y mantener el CPU
+        await asyncio.to_thread(_process_and_embed_text_file, tmp_name, file_id)
+    except Exception as e:
+        logger.error(f"!!! ERROR CRÍTICO EN PROCESO !!!: {e}", exc_info=True)
+        return {"status": "error", "detail": str(e)}
+    finally:
+        if os.path.exists(tmp_name): os.unlink(tmp_name)
         
-    return {"status": "ok"}
+    return {"status": "success"}
 
 @app.post("/query")
 async def query_rag_handler(request_data: QueryRequest):
