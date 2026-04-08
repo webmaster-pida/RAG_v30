@@ -8,19 +8,18 @@ import re
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 
-# --- 1. CONFIGURACIÓN GLOBAL Y CLIENTES ---
-# Diccionario global para mantener las conexiones a GCP activas
+# --- 1. CONFIGURACIÓN Y CLIENTES GLOBALES ---
 clients = {}
 COLLECTION_NAME = "pida_knowledge_base_v2"
 
-# Silenciamos advertencias de versiones de las librerías de Google
-warnings.filterwarnings("ignore")
+# Silenciar advertencias innecesarias de las librerías de Google
+warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-# Librerías de LangChain y Google Cloud
+# LangChain y Google Cloud
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -28,27 +27,27 @@ from langchain_google_firestore import FirestoreVectorStore
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK de Google GenAI y VertexAI
+# SDK google-genai y VertexAI
 from google import genai
 from google.genai.types import EmbedContentConfig
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 import vertexai
 
-# Configuración de Logging para ver el progreso en Cloud Run
+# Configuración de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- 2. CLASES DE SOPORTE ---
-
+# --- 2. MODELOS DE DATOS (PYDANTIC) ---
 class QueryRequest(BaseModel):
     query: str
     top_k: int = 5
     fetch_k: int = 15
 
+# --- 3. CLASE DE EMBEDDINGS (2048d) ---
 class ModernGeminiEmbeddings(Embeddings):
     """
-    Genera vectores de 2048 dimensiones. 
-    Firestore NO acepta 3072, por lo que aquí forzamos la compatibilidad.
+    Genera embeddings de 2048 dimensiones usando el modelo moderno de Gemini.
+    Firestore requiere exactamente 2048 o menos.
     """
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
@@ -74,87 +73,86 @@ class ModernGeminiEmbeddings(Embeddings):
             batch = texts[i:i + batch_size]
             results = self._get_embeddings_with_retry(batch, "RETRIEVAL_DOCUMENT")
             embeddings.extend(results)
+            logger.info(f"Lote de embeddings generado ({len(embeddings)} procesados)")
         return embeddings
 
     def embed_query(self, text: str) -> List[float]:
         results = self._get_embeddings_with_retry([text], "RETRIEVAL_QUERY")
         return results[0]
 
-# --- 3. LÓGICA DE EXTRACCIÓN Y LIMPIEZA AUTOMÁTICA ---
+# --- 4. FUNCIONES DE PROCESAMIENTO Y LIMPIEZA ---
 
-def _extract_metadata_robust(raw_text: str, filename: str):
+def _extract_clean_metadata(raw_text: str, filename: str):
     """
-    Identifica título y autor sin intervención humana.
-    Prioriza IA, luego patrones de texto y finalmente el nombre del archivo.
+    Extrae Título y Autor asumiendo un Markdown limpio (1 solo H1 y autor debajo),
+    pero utilizando IA para garantizar precisión y manejar variaciones.
     """
-    # Intentar con IA primero (Analizando los primeros 8000 caracteres)
     model = clients['metadata_model']
-    t_ai, a_ai = None, None
     try:
         prompt = (
-            "Analiza el inicio de este documento legal. Extrae el Título y el Autor Reales. "
-            "Ignora placeholders como '[Author Name]' o '[Exact Book Title]'. "
-            "Responde solo con el JSON: {'title': '...', 'author': '...'}\n\n"
-            f"Texto:\n{raw_text[:8000]}"
+            "Lee el inicio de este libro jurídico en Markdown. Extrae el Título Principal y el Autor.\n"
+            "REGLAS:\n"
+            "1. El título suele ser el único H1 (#).\n"
+            "2. El autor suele estar en negritas inmediatamente debajo del título.\n"
+            "3. Ignora textos como 'Prólogo', 'A quienes piensan...', etc.\n"
+            f"TEXTO A ANALIZAR:\n{raw_text[:5000]}\n\n"
+            "Responde estrictamente con este formato JSON:\n"
+            "{'title': 'Título exacto', 'author': 'Nombre del Autor'}"
         )
-        res = model.generate_content(prompt, generation_config=GenerationConfig(response_mime_type="application/json", temperature=0))
+        res = model.generate_content(
+            prompt, 
+            generation_config=GenerationConfig(response_mime_type="application/json", temperature=0)
+        )
         meta = json.loads(res.text)
-        t_ai = meta.get("title")
-        a_ai = meta.get("author")
-    except:
-        pass
+        
+        title = meta.get("title", filename.replace(".md", ""))
+        author = meta.get("author", "Autor Desconocido")
+        
+        # Salvavidas de seguridad final
+        if not author or "Desconocido" in author or "Author Name" in author: 
+            author = "Fabián Salvioli"
+        if not title or len(title) < 5 or "Exact Book Title" in title: 
+            title = filename.replace(".md", "").replace("_", " ").title()
+            
+        return title.strip(), author.strip()
+    except Exception as e:
+        logger.error(f"Error IA Metadatos: {e}")
+        return filename.replace(".md", ""), "Fabián Salvioli"
 
-    # Si la IA falla, buscar por patrones de texto (Regex)
-    t_reg = re.search(r'Título:\s*([^\[\n\r]+)', raw_text, re.I)
-    a_reg = re.search(r'Autor:\s*([^\[\n\r]+)', raw_text, re.I)
-    
-    final_title = t_ai or (t_reg.group(1).strip() if t_reg else filename.replace(".md", ""))
-    final_author = a_ai or (a_reg.group(1).strip() if a_reg else "Fabián Salvioli")
-
-    # Limpiar posibles corchetes residuales de LlamaParse
-    final_title = re.sub(r'\[.*?\]', '', str(final_title)).strip()
-    final_author = re.sub(r'\[.*?\]', '', str(final_author)).strip()
-    
-    return final_title, final_author
-
-def _deep_clean_text(text: str) -> str:
-    """Elimina basura visual y etiquetas HTML del contenido de los fragmentos."""
-    # Eliminar etiquetas <sup> (notas al pie) y HTML
+def _clean_content_for_rag(text: str) -> str:
+    """
+    Red de seguridad: Elimina basura visual (HTML) y normaliza espacios.
+    Aunque LlamaParse mejore, esto asegura que el RAG nunca ingeste basura.
+    """
     text = re.sub(r'<sup>.*?</sup>', '', text)
     text = re.sub(r'<[^>]+>', '', text)
-    # Eliminar las líneas de Título/Autor inyectadas por LlamaParse para no duplicar
-    text = re.sub(r'# Título:.*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'Autor:.*', '', text, flags=re.IGNORECASE)
-    # Limpiar espacios
+    text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-def _full_process_workflow(file_path: str, filename: str):
-    """Workflow de automatización total de PDF/MD a Firestore."""
-    vector_store = clients['vector_store']
-    
+def _process_workflow(file_path: str, filename: str):
+    """Flujo de ingesta lineal, robusto y preparado para producción."""
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         raw_content = f.read()
 
-    # 1. Metadatos robustos
-    title, author = _extract_metadata_robust(raw_content, filename)
-    logger.info(f"Procesando: {title} | Autor: {author}")
+    # 1. Extracción de Metadatos sobre el texto crudo
+    title, author = _extract_clean_metadata(raw_content, filename)
+    logger.info(f"--- INGESTANDO: {title} | AUTOR: {author} ---")
 
-    # 2. Limpieza del contenido
-    clean_content = _deep_clean_text(raw_content)
+    # 2. Limpieza de seguridad para los vectores
+    clean_content = _clean_content_for_rag(raw_content)
 
-    # 3. Chunking Jerárquico (Headers Markdown + Tamaño)
+    # 3. Chunking Jerárquico Natural
     md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","H1"),("##","H2"),("###","H3")])
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=250)
     
-    header_docs = md_splitter.split_text(clean_content)
-    chunks = text_splitter.split_documents(header_docs)
+    chunks = text_splitter.split_documents(md_splitter.split_text(clean_content))
     
     docs_to_db = []
     for i, chunk in enumerate(chunks):
-        # Filtro: Omitir fragmentos de índice o muy cortos
+        # Filtro de calidad: omitir fragmentos inútiles o índices
         if len(chunk.page_content) < 150: continue
-        if "ÍNDICE" in chunk.page_content.upper() and len(chunk.page_content) < 800: continue
+        if "ÍNDICE" in chunk.page_content.upper() and len(chunk.page_content) < 1000: continue
 
         chunk.metadata.update({
             "source": filename,
@@ -164,74 +162,89 @@ def _full_process_workflow(file_path: str, filename: str):
         })
         docs_to_db.append(Document(page_content=chunk.page_content, metadata=chunk.metadata))
     
-    # 4. Guardado en lotes (Batch)
+    # 4. Guardado en Firestore
     if docs_to_db:
+        vector_store = clients['vector_store']
         batch_size = 50
         for i in range(0, len(docs_to_db), batch_size):
             vector_store.add_documents(docs_to_db[i:i + batch_size])
-        logger.info(f"✅ Libro indexado: {title} ({len(docs_to_db)} fragmentos)")
+        logger.info(f"✅ Éxito: {len(docs_to_db)} fragmentos guardados para '{title}'.")
 
-# --- 4. LIFESPAN E INICIALIZACIÓN ---
+# --- 5. LIFESPAN E INICIALIZACIÓN ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     PROJECT_ID = os.environ.get("PROJECT_ID")
-    vertexai.init(project=PROJECT_ID, location="us-central1")
+    LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
     
     clients['firestore'] = firestore.Client()
     clients['storage'] = storage.Client()
     clients['embedding'] = ModernGeminiEmbeddings()
-    clients['metadata_model'] = GenerativeModel("gemini-1.5-flash")
+    clients['metadata_model'] = GenerativeModel("gemini-2.0-flash")
     clients['vector_store'] = FirestoreVectorStore(
-        collection=COLLECTION_NAME,
-        embedding_service=clients['embedding'],
+        collection=COLLECTION_NAME, 
+        embedding_service=clients['embedding'], 
         client=clients['firestore']
     )
-    logger.info("--- RAG v30: Sistema de Automatización Inicializado ---")
+    logger.info("--- Backend RAG v30 (Producción Completa) Inicializado ---")
     yield
     clients.clear()
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 5. ENDPOINTS DE COMUNICACIÓN ---
+# --- 6. ENDPOINTS ---
 
 @app.post("/")
-async def handle_gcs_notification(request: Request):
-    """Endpoint que recibe el archivo desde Google Cloud Storage."""
+async def handle_gcs_event(request: Request):
+    """Webhook de Eventarc para procesar archivos subidos al Storage."""
     event = await request.json()
     file_id = event.get("name")
     bucket_name = event.get("bucket")
     
-    if not file_id or not file_id.lower().endswith(".md"):
+    if not file_id or not bucket_name:
+        return {"status": "ignored", "reason": "Faltan datos en el evento"}
+        
+    if not file_id.lower().endswith(".md"):
+        logger.info(f"Ignorado por no ser Markdown: {file_id}")
         return {"status": "ignored"}
 
-    logger.info(f"Archivo detectado en bucket: {file_id}")
+    logger.info(f"Iniciando descarga y proceso: {file_id}")
     blob = clients['storage'].bucket(bucket_name).blob(file_id)
     
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         blob.download_to_filename(tmp.name)
-        # Síncrono para Cloud Run (Mantiene CPU al 100%)
-        await asyncio.to_thread(_full_process_workflow, tmp.name, file_id)
+        # Hilo separado síncrono para mantener CPU en Cloud Run
+        await asyncio.to_thread(_process_workflow, tmp.name, file_id)
         os.unlink(tmp.name)
         
     return {"status": "success"}
 
 @app.post("/query")
-async def handle_query(request: QueryRequest):
-    """Endpoint para buscar información en la base de conocimientos."""
+async def handle_query(request_data: QueryRequest):
+    """
+    Endpoint para el Chat Frontend. Devuelve los fragmentos estructurados
+    con los metadatos precisos para generar las citas bibliográficas.
+    """
     vector_store = clients['vector_store']
-    docs = vector_store.max_marginal_relevance_search(
-        query=request.query, 
-        k=request.top_k, 
-        fetch_k=request.fetch_k
-    )
-    return {
-        "results": [
-            {
-                "content": d.page_content, 
-                "title": d.metadata.get("title"), 
-                "author": d.metadata.get("author"),
-                "source": d.metadata.get("source")
-            } for d in docs
-        ]
-    }
+    
+    try:
+        docs = vector_store.max_marginal_relevance_search(
+            query=request_data.query, 
+            k=request_data.top_k,
+            fetch_k=request_data.fetch_k
+        )
+        
+        return {
+            "results": [
+                {
+                    "content": d.page_content, 
+                    "title": d.metadata.get("title"), 
+                    "author": d.metadata.get("author"),
+                    "source": d.metadata.get("source")
+                } for d in docs
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error en la búsqueda vectorial: {e}")
+        raise HTTPException(status_code=500, detail="Error procesando la búsqueda en la base de conocimientos")
