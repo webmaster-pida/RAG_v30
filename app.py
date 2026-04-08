@@ -3,9 +3,11 @@ import json
 import logging
 import tempfile
 import warnings
+import asyncio  # <--- Movido aquí, al inicio
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 
+# Filtramos advertencias de librerías
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -20,11 +22,9 @@ from langchain_google_firestore import FirestoreVectorStore
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# NUEVO: SDK google-genai unificado
+# SDK google-genai y VertexAI
 from google import genai
 from google.genai.types import EmbedContentConfig
-
-# Mantenemos el modelo generativo anterior para la extracción de metadatos JSON
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 import vertexai
 
@@ -202,7 +202,7 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
 # --- ENDPOINTS ---
 
 @app.post("/")
-async def handle_gcs_event(request: Request, background_tasks: BackgroundTasks):
+async def handle_gcs_event(request: Request):
     event = await request.json()
     if not event: raise HTTPException(status_code=400, detail="Sin body")
 
@@ -212,22 +212,24 @@ async def handle_gcs_event(request: Request, background_tasks: BackgroundTasks):
     if not bucket_name or not file_id: return {"status": "ignored"}
     if not (file_id.endswith(".txt") or file_id.endswith(".md")): return {"status": "ignored"}
 
-    def download_and_process():
-        storage_client = clients.get('storage')
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(file_id)
-        if not blob.exists() or blob.size == 0: return
+    storage_client = clients.get('storage')
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(file_id)
+    if not blob.exists() or blob.size == 0: return {"status": "ignored"}
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp_file:
-            blob.download_to_filename(temp_file.name)
-            temp_path = temp_file.name
-        try:
-            _process_and_embed_text_file(temp_path, file_id)
-        finally:
-            if os.path.exists(temp_path): os.unlink(temp_path)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp_file:
+        blob.download_to_filename(temp_file.name)
+        temp_path = temp_file.name
+    try:
+        logger.info(f"Descarga completada. Iniciando procesamiento SÍNCRONO de {file_id}")
+        
+        # OBLIGAMOS a Cloud Run a esperar y mantener el CPU al 100%
+        await asyncio.to_thread(_process_and_embed_text_file, temp_path, file_id)
+        
+    finally:
+        if os.path.exists(temp_path): os.unlink(temp_path)
 
-    background_tasks.add_task(download_and_process)
-    return {"status": "accepted", "message": f"Procesando {file_id}"}
+    return {"status": "ok", "message": f"Procesamiento 100% finalizado para {file_id}"}
 
 
 @app.post("/query")
