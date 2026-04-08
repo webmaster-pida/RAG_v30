@@ -4,9 +4,12 @@ import logging
 import tempfile
 import warnings
 import asyncio
-import re  # <--- Librería para limpieza de texto
+import re
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
+
+# --- 1. DEFINICIÓN GLOBAL (CRÍTICO) ---
+clients = {} 
 
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
 
@@ -29,13 +32,13 @@ import vertexai
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "pida_knowledge_base_v2" 
+COLLECTION_NAME = "pida_knowledge_base_v2"
 
 class ModernGeminiEmbeddings(Embeddings):
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
         self.dimensionality = dimensionality
-        self.client = genai.Client() 
+        self.client = genai.Client()
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(5))
     def _get_embeddings_with_retry(self, texts: List[str], task_type: str) -> List[List[float]]:
@@ -60,33 +63,32 @@ class ModernGeminiEmbeddings(Embeddings):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Inicialización de clientes
     PROJECT_ID = os.environ.get("PROJECT_ID")
     VERTEX_AI_LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
     vertexai.init(project=PROJECT_ID, location=VERTEX_AI_LOCATION)
+    
     clients['firestore'] = firestore.Client()
     clients['storage'] = storage.Client()
     clients['embedding'] = ModernGeminiEmbeddings()
     clients['metadata_model'] = GenerativeModel("gemini-2.5-flash")
     clients['vector_store'] = FirestoreVectorStore(
-        collection=COLLECTION_NAME, 
-        embedding_service=clients['embedding'], 
+        collection=COLLECTION_NAME,
+        embedding_service=clients['embedding'],
         client=clients['firestore']
     )
-    logger.info("--- RAG v30: LIMPIEZA ACTIVA (2048d) ---")
+    logger.info("--- RAG v30 (2048d) INICIALIZADO CORRECTAMENTE ---")
     yield
     clients.clear()
 
 app = FastAPI(lifespan=lifespan)
 
 def _clean_text(text: str) -> str:
-    """Elimina etiquetas HTML y ruido de formato."""
-    # 1. Eliminar etiquetas <sup>...</sup> y su contenido (números de nota)
+    # Eliminar HTML como <sup> y normalizar espacios
     text = re.sub(r'<sup>.*?</sup>', '', text)
-    # 2. Eliminar cualquier otra etiqueta HTML residual
     text = re.sub(r'<[^>]+>', '', text)
-    # 3. Normalizar espacios en blanco y saltos de línea
-    text = re.sub(r'\n{3,}', '\n\n', text) # Máximo 2 saltos de línea
-    text = re.sub(r' +', ' ', text) # Eliminar espacios dobles
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' +', ' ', text)
     return text.strip()
 
 def _process_and_embed_text_file(file_path: str, filename: str):
@@ -97,7 +99,6 @@ def _process_and_embed_text_file(file_path: str, filename: str):
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         raw_content = f.read()
     
-    # LIMPIEZA DE "COSAS EXTRAÑAS"
     text_content = _clean_text(raw_content)
     
     # 1. Metadatos
@@ -112,10 +113,9 @@ def _process_and_embed_text_file(file_path: str, filename: str):
         doc_author = meta.get("author", "Autor Desconocido")
     except: pass
 
-    # 2. Chunking (Jerárquico por Markdown)
+    # 2. Chunking
     md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","H1"),("##","H2"),("###","H3")])
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=250)
-    
     chunks = text_splitter.split_documents(md_splitter.split_text(text_content))
     
     documents = []
@@ -124,20 +124,24 @@ def _process_and_embed_text_file(file_path: str, filename: str):
         m.update({"source": filename, "title": doc_title, "author": doc_author, "index": i})
         documents.append(Document(page_content=chunk.page_content, metadata=m))
     
-    # 3. Guardado Síncrono
+    # 3. Guardado
     batch_size = 50
     for i in range(0, len(documents), batch_size):
         vector_store.add_documents(documents[i:i + batch_size])
-        logger.info(f"Progreso {filename}: Lote {i//batch_size + 1} guardado.")
+    logger.info(f"--- ÉXITO: {filename} indexado ---")
 
 @app.post("/")
 async def handle_gcs_event(request: Request):
     event = await request.json()
-    bucket_name, file_id = event.get("bucket"), event.get("name")
-    if not bucket_name or not file_id or not file_id.endswith(".md"): return {"status": "ignored"}
+    bucket_name = event.get("bucket")
+    file_id = event.get("name")
+    
+    if not bucket_name or not file_id or not file_id.endswith(".md"):
+        return {"status": "ignored"}
 
-    logger.info(f"Procesando: {file_id}")
-    blob = clients.get('storage').bucket(bucket_name).blob(file_id)
+    logger.info(f"Procesando archivo: {file_id}")
+    storage_client = clients.get('storage')
+    blob = storage_client.bucket(bucket_name).blob(file_id)
     
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         blob.download_to_filename(tmp.name)
@@ -145,3 +149,12 @@ async def handle_gcs_event(request: Request):
         os.unlink(tmp.name)
         
     return {"status": "success"}
+
+@app.post("/query")
+async def query_rag_handler(query_data: Dict[str, Any]):
+    vector_store = clients.get('vector_store')
+    query_text = query_data.get("query")
+    top_k = query_data.get("top_k", 5)
+    
+    found_docs = vector_store.max_marginal_relevance_search(query=query_text, k=top_k)
+    return {"results": [{"content": d.page_content, "title": d.metadata.get("title")} for d in found_docs]}
