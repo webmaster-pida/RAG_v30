@@ -121,13 +121,23 @@ def _extract_clean_metadata(raw_text: str, filename: str):
 
 def _clean_content_for_rag(text: str) -> str:
     """
-    Red de seguridad: Elimina basura visual (HTML) y normaliza espacios.
-    Aunque LlamaParse mejore, esto asegura que el RAG nunca ingeste basura.
+    Red de seguridad: Elimina basura visual (HTML y LaTeX) y normaliza espacios.
     """
+    # 1. Eliminar superíndices HTML (por si acaso)
     text = re.sub(r'<sup>.*?</sup>', '', text)
     text = re.sub(r'<[^>]+>', '', text)
+    
+    # 2. NUEVO: Eliminar superíndices estilo LaTeX inyectados por LlamaParse (ej: $^{34}$)
+    text = re.sub(r'\$\^\{.*?\}\$', '', text)
+    
+    # 3. Eliminar la palabra "Ibídem" y páginas sueltas si quedaron huérfanas en medio del texto
+    # (Opcional pero recomendado para limpiar referencias bibliográficas rotas)
+    text = re.sub(r'Ibídem,?\s*pp?\.\s*\d+(-\d+)?\.?', '', text, flags=re.IGNORECASE)
+    
+    # 4. Normalizar saltos de línea y espacios
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' +', ' ', text)
+    
     return text.strip()
 
 def _process_workflow(file_path: str, filename: str):
