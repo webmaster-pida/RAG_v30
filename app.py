@@ -181,7 +181,10 @@ async def lifespan(app: FastAPI):
     clients['firestore'] = firestore.Client()
     clients['storage'] = storage.Client()
     clients['embedding'] = ModernGeminiEmbeddings()
-    clients['metadata_model'] = GenerativeModel("gemini-2.0-flash")
+    
+    # RESTAURADO AL MODELO ORIGINAL DEL USUARIO
+    clients['metadata_model'] = GenerativeModel("gemini-2.5-flash")
+    
     clients['vector_store'] = FirestoreVectorStore(
         collection=COLLECTION_NAME, 
         embedding_service=clients['embedding'], 
