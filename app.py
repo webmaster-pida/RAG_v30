@@ -8,18 +8,19 @@ import re
 from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 
-# --- 1. CONFIGURACIÓN Y CLIENTES GLOBALES ---
+# --- 1. CONFIGURACIÓN GLOBAL Y CLIENTES ---
+# Diccionario global para mantener las conexiones a GCP activas
 clients = {}
 COLLECTION_NAME = "pida_knowledge_base_v2"
 
-# Silenciar advertencias innecesarias de las librerías de Google
-warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
+# Silenciamos advertencias de versiones de las librerías de Google
+warnings.filterwarnings("ignore")
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-# LangChain y Google Cloud
+# Librerías de LangChain y Google Cloud
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -27,13 +28,13 @@ from langchain_google_firestore import FirestoreVectorStore
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK google-genai y VertexAI
+# SDK de Google GenAI y VertexAI
 from google import genai
 from google.genai.types import EmbedContentConfig
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 import vertexai
 
-# Configuración de Logs
+# Configuración de Logging para ver el progreso en Cloud Run
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,8 @@ class QueryRequest(BaseModel):
 
 class ModernGeminiEmbeddings(Embeddings):
     """
-    Genera embeddings de 2048 dimensiones usando el modelo moderno de Gemini.
-    Firestore requiere exactamente 2048 o menos.
+    Genera vectores de 2048 dimensiones. 
+    Firestore NO acepta 3072, por lo que aquí forzamos la compatibilidad.
     """
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
@@ -73,187 +74,164 @@ class ModernGeminiEmbeddings(Embeddings):
             batch = texts[i:i + batch_size]
             results = self._get_embeddings_with_retry(batch, "RETRIEVAL_DOCUMENT")
             embeddings.extend(results)
-            logger.info(f"Lote de embeddings generado ({len(embeddings)} procesados)")
         return embeddings
 
     def embed_query(self, text: str) -> List[float]:
         results = self._get_embeddings_with_retry([text], "RETRIEVAL_QUERY")
         return results[0]
 
-# --- 3. FUNCIONES DE LIMPIEZA Y PROCESAMIENTO ---
+# --- 3. LÓGICA DE EXTRACCIÓN Y LIMPIEZA AUTOMÁTICA ---
 
-def _deep_clean(text: str) -> str:
-    """Borra automáticamente la basura de LlamaParse y etiquetas HTML."""
-    # Eliminar placeholders inyectados por error de LlamaParse
-    text = re.sub(r'# Título:.*\[Exact Book Title\].*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\*\*Autor:\*\*.*\[Author Name\].*', '', text, flags=re.IGNORECASE)
-    # Eliminar etiquetas <sup>...</sup> (números de notas al pie en HTML)
+def _extract_metadata_robust(raw_text: str, filename: str):
+    """
+    Identifica título y autor sin intervención humana.
+    Prioriza IA, luego patrones de texto y finalmente el nombre del archivo.
+    """
+    # Intentar con IA primero (Analizando los primeros 8000 caracteres)
+    model = clients['metadata_model']
+    t_ai, a_ai = None, None
+    try:
+        prompt = (
+            "Analiza el inicio de este documento legal. Extrae el Título y el Autor Reales. "
+            "Ignora placeholders como '[Author Name]' o '[Exact Book Title]'. "
+            "Responde solo con el JSON: {'title': '...', 'author': '...'}\n\n"
+            f"Texto:\n{raw_text[:8000]}"
+        )
+        res = model.generate_content(prompt, generation_config=GenerationConfig(response_mime_type="application/json", temperature=0))
+        meta = json.loads(res.text)
+        t_ai = meta.get("title")
+        a_ai = meta.get("author")
+    except:
+        pass
+
+    # Si la IA falla, buscar por patrones de texto (Regex)
+    t_reg = re.search(r'Título:\s*([^\[\n\r]+)', raw_text, re.I)
+    a_reg = re.search(r'Autor:\s*([^\[\n\r]+)', raw_text, re.I)
+    
+    final_title = t_ai or (t_reg.group(1).strip() if t_reg else filename.replace(".md", ""))
+    final_author = a_ai or (a_reg.group(1).strip() if a_reg else "Fabián Salvioli")
+
+    # Limpiar posibles corchetes residuales de LlamaParse
+    final_title = re.sub(r'\[.*?\]', '', str(final_title)).strip()
+    final_author = re.sub(r'\[.*?\]', '', str(final_author)).strip()
+    
+    return final_title, final_author
+
+def _deep_clean_text(text: str) -> str:
+    """Elimina basura visual y etiquetas HTML del contenido de los fragmentos."""
+    # Eliminar etiquetas <sup> (notas al pie) y HTML
     text = re.sub(r'<sup>.*?</sup>', '', text)
-    # Eliminar cualquier otra etiqueta HTML residual
     text = re.sub(r'<[^>]+>', '', text)
-    # Normalizar espacios y saltos de línea excesivos
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Eliminar las líneas de Título/Autor inyectadas por LlamaParse para no duplicar
+    text = re.sub(r'# Título:.*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'Autor:.*', '', text, flags=re.IGNORECASE)
+    # Limpiar espacios
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
-def _extract_real_metadata(text_content: str, filename: str):
-    """Extrae metadatos reales usando Gemini 2.0 Flash."""
-    model = clients['metadata_model']
-    try:
-        # Analizamos el inicio del texto para identificar título y autor reales
-        prompt = (
-            "Analiza el siguiente texto de un libro. Extrae el Título Real y el Autor Real. "
-            "Ignora cualquier texto genérico o placeholders. Responde estrictamente en JSON.\n\n"
-            f"Texto:\n{text_content[:5000]}"
-        )
-        res = model.generate_content(
-            prompt, 
-            generation_config=GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
-        )
-        meta = json.loads(res.text)
-        title = meta.get("title", filename)
-        author = meta.get("author", "Autor Desconocido")
-        return title, author
-    except Exception as e:
-        logger.warning(f"Fallo al extraer metadatos con IA: {e}")
-        return filename, "Autor Desconocido"
-
-def _process_and_embed_text_file(file_path: str, filename: str):
-    """Proceso principal de transformación de archivo a vectores."""
+def _full_process_workflow(file_path: str, filename: str):
+    """Workflow de automatización total de PDF/MD a Firestore."""
     vector_store = clients['vector_store']
     
     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
         raw_content = f.read()
-    
-    # 1. Limpieza automática
-    text_content = _deep_clean(raw_content)
-    if not text_content:
-        logger.error(f"El archivo {filename} quedó vacío tras la limpieza.")
-        return
 
-    # 2. Extracción de metadatos
-    doc_title, doc_author = _extract_real_metadata(text_content, filename)
-    logger.info(f"Metadatos: Título='{doc_title}', Autor='{doc_author}'")
+    # 1. Metadatos robustos
+    title, author = _extract_metadata_robust(raw_content, filename)
+    logger.info(f"Procesando: {title} | Autor: {author}")
 
-    # 3. Chunking Jerárquico
-    # Primero dividimos por encabezados Markdown (#, ##, ###)
-    md_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=[("#", "H1"), ("##", "H2"), ("###", "H3")]
-    )
-    # Luego dividimos en fragmentos de 2000 caracteres para asegurar consistencia
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000, 
-        chunk_overlap=250
-    )
+    # 2. Limpieza del contenido
+    clean_content = _deep_clean_text(raw_content)
+
+    # 3. Chunking Jerárquico (Headers Markdown + Tamaño)
+    md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","H1"),("##","H2"),("###","H3")])
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=250)
     
-    md_header_docs = md_splitter.split_text(text_content)
-    chunks = text_splitter.split_documents(md_header_docs)
+    header_docs = md_splitter.split_text(clean_content)
+    chunks = text_splitter.split_documents(header_docs)
     
-    documents_to_upload = []
+    docs_to_db = []
     for i, chunk in enumerate(chunks):
-        # Filtro automático: Si el fragmento es solo el Índice o muy corto, lo saltamos
-        content_upper = chunk.page_content.upper()
-        if "ÍNDICE" in content_upper and len(chunk.page_content) < 600:
-            continue
-            
-        metadata = chunk.metadata.copy()
-        metadata.update({
+        # Filtro: Omitir fragmentos de índice o muy cortos
+        if len(chunk.page_content) < 150: continue
+        if "ÍNDICE" in chunk.page_content.upper() and len(chunk.page_content) < 800: continue
+
+        chunk.metadata.update({
             "source": filename,
-            "title": doc_title,
-            "author": doc_author,
+            "title": title,
+            "author": author,
             "chunk_index": i
         })
-        documents_to_upload.append(Document(page_content=chunk.page_content, metadata=metadata))
+        docs_to_db.append(Document(page_content=chunk.page_content, metadata=chunk.metadata))
     
-    # 4. Inserción en Firestore (Batch de 50 para evitar límites de API)
-    logger.info(f"Subiendo {len(documents_to_upload)} fragmentos a Firestore...")
-    batch_size = 50
-    for i in range(0, len(documents_to_upload), batch_size):
-        batch = documents_to_upload[i:i + batch_size]
-        vector_store.add_documents(batch)
-        logger.info(f"Progreso {filename}: Lote {i//batch_size + 1} completado.")
+    # 4. Guardado en lotes (Batch)
+    if docs_to_db:
+        batch_size = 50
+        for i in range(0, len(docs_to_db), batch_size):
+            vector_store.add_documents(docs_to_db[i:i + batch_size])
+        logger.info(f"✅ Libro indexado: {title} ({len(docs_to_db)} fragmentos)")
 
-    logger.info(f"--- ÉXITO: {filename} indexado correctamente ---")
-
-# --- 4. LIFESPAN Y APLICACIÓN ---
+# --- 4. LIFESPAN E INICIALIZACIÓN ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Inicialización al arrancar el contenedor
     PROJECT_ID = os.environ.get("PROJECT_ID")
-    LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    vertexai.init(project=PROJECT_ID, location="us-central1")
     
     clients['firestore'] = firestore.Client()
     clients['storage'] = storage.Client()
     clients['embedding'] = ModernGeminiEmbeddings()
-    clients['metadata_model'] = GenerativeModel("gemini-2.0-flash")
+    clients['metadata_model'] = GenerativeModel("gemini-1.5-flash")
     clients['vector_store'] = FirestoreVectorStore(
         collection=COLLECTION_NAME,
         embedding_service=clients['embedding'],
         client=clients['firestore']
     )
-    logger.info("--- Microservicio RAG v30 (Automatización Total) Inicializado ---")
+    logger.info("--- RAG v30: Sistema de Automatización Inicializado ---")
     yield
     clients.clear()
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 5. ENDPOINTS ---
+# --- 5. ENDPOINTS DE COMUNICACIÓN ---
 
 @app.post("/")
-async def handle_gcs_event(request: Request):
-    """Recibe notificaciones de Eventarc cuando subes un archivo al Bucket."""
+async def handle_gcs_notification(request: Request):
+    """Endpoint que recibe el archivo desde Google Cloud Storage."""
     event = await request.json()
-    bucket_name = event.get("bucket")
     file_id = event.get("name")
+    bucket_name = event.get("bucket")
     
-    if not bucket_name or not file_id:
-        return {"status": "ignored", "reason": "No bucket/name"}
-        
-    if not (file_id.lower().endswith(".md") or file_id.lower().endswith(".txt")):
-        logger.info(f"Ignorando archivo por extensión: {file_id}")
-        return {"status": "ignored", "reason": "Extension not supported"}
+    if not file_id or not file_id.lower().endswith(".md"):
+        return {"status": "ignored"}
 
-    logger.info(f"Evento recibido: {file_id} en bucket {bucket_name}")
+    logger.info(f"Archivo detectado en bucket: {file_id}")
+    blob = clients['storage'].bucket(bucket_name).blob(file_id)
     
-    storage_client = clients.get('storage')
-    blob = storage_client.bucket(bucket_name).blob(file_id)
-    
-    if not blob.exists():
-        return {"status": "error", "reason": "File not found"}
-
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         blob.download_to_filename(tmp.name)
-        # Ejecución síncrona en hilo separado para mantener vivo el CPU de Cloud Run
-        await asyncio.to_thread(_process_and_embed_text_file, tmp.name, file_id)
+        # Síncrono para Cloud Run (Mantiene CPU al 100%)
+        await asyncio.to_thread(_full_process_workflow, tmp.name, file_id)
         os.unlink(tmp.name)
         
-    return {"status": "success", "file": file_id}
+    return {"status": "success"}
 
 @app.post("/query")
-async def query_rag_handler(request_data: QueryRequest):
-    """Endpoint para que el Chat haga las consultas vectoriales."""
-    vector_store = clients.get('vector_store')
-    
-    # max_marginal_relevance_search para evitar resultados redundantes
-    found_docs = vector_store.max_marginal_relevance_search(
-        query=request_data.query,
-        k=request_data.top_k,
-        fetch_k=request_data.fetch_k,
-        lambda_mult=0.5
+async def handle_query(request: QueryRequest):
+    """Endpoint para buscar información en la base de conocimientos."""
+    vector_store = clients['vector_store']
+    docs = vector_store.max_marginal_relevance_search(
+        query=request.query, 
+        k=request.top_k, 
+        fetch_k=request.fetch_k
     )
-    
-    results = []
-    for d in found_docs:
-        results.append({
-            "content": d.page_content,
-            "source": d.metadata.get("source"),
-            "title": d.metadata.get("title"),
-            "author": d.metadata.get("author")
-        })
-        
-    return {"results": results}
+    return {
+        "results": [
+            {
+                "content": d.page_content, 
+                "title": d.metadata.get("title"), 
+                "author": d.metadata.get("author"),
+                "source": d.metadata.get("source")
+            } for d in docs
+        ]
+    }
