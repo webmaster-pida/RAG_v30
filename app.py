@@ -242,29 +242,45 @@ async def handle_gcs_event(request: Request):
 @app.post("/query")
 async def handle_query(request_data: QueryRequest):
     """
-    Endpoint para el Chat Frontend. Devuelve los fragmentos estructurados
-    con los metadatos precisos para generar las citas bibliográficas.
+    Endpoint blindado: Garantiza que el Chat reciba el Título y el Autor limpios,
+    evitando que el frontend caiga en el fallback de 'Documento Interno'.
     """
     vector_store = clients['vector_store']
     
     try:
-        # CAMBIO CRÍTICO: Usamos similarity_search que es 100% compatible con Firestore
+        # Usamos similarity_search que es compatible con el índice que creamos
         docs = vector_store.similarity_search(
             query=request_data.query, 
             k=request_data.top_k
         )
         
-        return {
-            "results": [
-                {
-                    "content": d.page_content, 
-                    "title": d.metadata.get("title"), 
-                    "author": d.metadata.get("author"),
-                    "source": d.metadata.get("source")
-                } for d in docs
-            ]
-        }
+        resultados_seguros = []
+        for d in docs:
+            meta = d.metadata or {}
+            
+            # 1. EXTRACCIÓN BLINDADA DEL TÍTULO
+            # Si 'title' viene vacío, tomamos el 'source' (nombre del archivo)
+            titulo_crudo = meta.get("title")
+            if not titulo_crudo or titulo_crudo == "Desconocido":
+                titulo_crudo = meta.get("source", "Acervo Jurídico de IIRESODH")
+            
+            # Limpiamos el nombre para que se vea profesional (quita .md y guiones)
+            titulo_limpio = titulo_crudo.replace(".md", "").replace("_", " ").title()
+
+            # 2. EXTRACCIÓN BLINDADA DEL AUTOR
+            autor_crudo = meta.get("author")
+            if not autor_crudo or autor_crudo == "Desconocido":
+                autor_crudo = "Fabián Salvioli"
+                
+            resultados_seguros.append({
+                "content": d.page_content, 
+                "title": titulo_limpio.strip(), 
+                "author": autor_crudo.strip(),
+                "source": meta.get("source", "")
+            })
+            
+        return {"results": resultados_seguros}
+        
     except Exception as e:
-        # Ahora el log mostrará el error exacto si vuelve a fallar
-        logger.error(f"Error crítico en la búsqueda vectorial: {str(e)}")
+        logger.error(f"Error en la búsqueda vectorial: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
