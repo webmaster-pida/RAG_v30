@@ -212,9 +212,15 @@ async def handle_gcs_event(request: Request):
         logger.info(f"Ignorado por no ser Markdown: {file_id}")
         return {"status": "ignored"}
 
-    logger.info(f"Iniciando descarga y proceso: {file_id}")
+    logger.info(f"Evento detectado para: {file_id}")
     blob = clients['storage'].bucket(bucket_name).blob(file_id)
     
+    # --- FILTRO DE SEGURIDAD PARA EVENTOS DE BORRADO ---
+    if not blob.exists():
+        logger.info(f"El archivo {file_id} ya no existe en el bucket. Ignorando evento de borrado.")
+        return {"status": "ignored", "reason": "File was deleted"}
+
+    logger.info(f"Iniciando descarga y proceso: {file_id}")
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         blob.download_to_filename(tmp.name)
         # Hilo separado síncrono para mantener CPU en Cloud Run
