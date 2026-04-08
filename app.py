@@ -248,10 +248,10 @@ async def handle_query(request_data: QueryRequest):
     vector_store = clients['vector_store']
     
     try:
-        docs = vector_store.max_marginal_relevance_search(
+        # CAMBIO CRÍTICO: Usamos similarity_search que es 100% compatible con Firestore
+        docs = vector_store.similarity_search(
             query=request_data.query, 
-            k=request_data.top_k,
-            fetch_k=request_data.fetch_k
+            k=request_data.top_k
         )
         
         return {
@@ -265,5 +265,6 @@ async def handle_query(request_data: QueryRequest):
             ]
         }
     except Exception as e:
-        logger.error(f"Error en la búsqueda vectorial: {e}")
-        raise HTTPException(status_code=500, detail="Error procesando la búsqueda en la base de conocimientos")
+        # Ahora el log mostrará el error exacto si vuelve a fallar
+        logger.error(f"Error crítico en la búsqueda vectorial: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
