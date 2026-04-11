@@ -46,13 +46,21 @@ class QueryRequest(BaseModel):
 # --- 3. CLASE DE EMBEDDINGS (2048d) ---
 class ModernGeminiEmbeddings(Embeddings):
     """
-    Genera embeddings de 2048 dimensiones usando el modelo moderno de Gemini.
-    Firestore requiere exactamente 2048 o menos.
+    Genera embeddings de 2048 dimensiones usando el modelo de vanguardia gemini-embedding-001.
     """
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
         self.dimensionality = dimensionality
-        self.client = genai.Client()
+        
+        # EL VERDADERO FIX: Inicialización explícita para no perder el contexto en hilos secundarios
+        PROJECT_ID = os.environ.get("PROJECT_ID", "pida-ai-v20")
+        LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
+        
+        self.client = genai.Client(
+            vertexai=True, 
+            project=PROJECT_ID, 
+            location=LOCATION
+        )
 
     @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(5))
     def _get_embeddings_with_retry(self, texts: List[str], task_type: str) -> List[List[float]]:
